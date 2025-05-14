@@ -192,8 +192,21 @@ func (s *Service) handler(ctx context.Context, b *bot.Bot, m *models.Update) {
 	if strings.HasPrefix(message.Text, "/start ") {
 		s.startHandler(ctx, b, m)
 		return
+	} else if strings.TrimSpace(message.Text) == "/help" {
+		s.helpHandler(ctx, b, m)
+		return
 	} else if strings.HasPrefix(message.Text, "/search ") {
+		// /search with argument
 		s.searchHandler(ctx, b, m)
+		return
+	} else if strings.TrimSpace(message.Text) == "/search" {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: message.Chat.ID,
+			Text:   "Please provide a search query. Usage: /search <query>",
+		})
+		return
+	} else if strings.HasPrefix(message.Text, "/last") {
+		s.lastHandler(ctx, b, m)
 		return
 	}
 
@@ -316,7 +329,7 @@ func (s *Service) startHandler(ctx context.Context, b *bot.Bot, m *models.Update
 	accessToken := strings.TrimPrefix(m.Message.Text, "/start ")
 
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("Authorization", fmt.Sprintf("Bearer %s", accessToken)))
-	user, err := s.client.AuthService.GetAuthStatus(ctx, &v1pb.GetAuthStatusRequest{})
+	_, err := s.client.AuthService.GetAuthStatus(ctx, &v1pb.GetAuthStatusRequest{})
 	if err != nil {
 		b.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: m.Message.Chat.ID,
@@ -326,14 +339,13 @@ func (s *Service) startHandler(ctx context.Context, b *bot.Bot, m *models.Update
 	}
 
 	s.store.SetUserAccessToken(userID, accessToken)
-	b.SendMessage(ctx, &bot.SendMessageParams{
-		ChatID: m.Message.Chat.ID,
-		Text:   fmt.Sprintf("Hello %s!", user.Nickname),
-	})
+	s.helpHandler(ctx, b, m)
 }
 
+
+
 func (s *Service) keyboard(memo *v1pb.Memo) *models.InlineKeyboardMarkup {
-	// add inline keyboard to edit memo's visibility or pinned status.
+	// add inline keyboard to edit memo's visibility, pinned status, or delete.
 	return &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
 			{
@@ -348,6 +360,10 @@ func (s *Service) keyboard(memo *v1pb.Memo) *models.InlineKeyboardMarkup {
 				{
 					Text:         "Pin",
 					CallbackData: fmt.Sprintf("pin %s", memo.Name),
+				},
+				{
+					Text:         "Delete",
+					CallbackData: fmt.Sprintf("delete %s", memo.Name),
 				},
 			},
 		},
@@ -402,6 +418,29 @@ func (s *Service) callbackQueryHandler(ctx context.Context, b *bot.Bot, update *
 		memo.Visibility = v1pb.Visibility_PRIVATE
 	case "pin":
 		memo.Pinned = !memo.Pinned
+	case "delete":
+		_, err := s.client.MemoService.DeleteMemo(ctx, &v1pb.DeleteMemoRequest{
+			Name: memo.Name,
+		})
+		if err != nil {
+			slog.Error("failed to delete memo", slog.Any("err", err))
+			b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+				CallbackQueryID: update.CallbackQuery.ID,
+				Text:            "Failed to delete memo",
+				ShowAlert:       true,
+			})
+			return
+		}
+		b.EditMessageText(ctx, &bot.EditMessageTextParams{
+			ChatID:    update.CallbackQuery.Message.Message.Chat.ID,
+			MessageID: update.CallbackQuery.Message.Message.ID,
+			Text:      "Memo deleted 🗑️",
+		})
+		b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
+			CallbackQueryID: update.CallbackQuery.ID,
+			Text:            "Memo deleted",
+		})
+		return
 	default:
 		b.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
 			CallbackQueryID: update.CallbackQuery.ID,
@@ -456,9 +495,100 @@ func (s *Service) callbackQueryHandler(ctx context.Context, b *bot.Bot, update *
 	})
 }
 
+func (s *Service) lastHandler(ctx context.Context, b *bot.Bot, m *models.Update) {
+	userID := m.Message.From.ID
+	args := strings.TrimSpace(strings.TrimPrefix(m.Message.Text, "/last"))
+	count := 1
+	if args != "" {
+		if n, err := fmt.Sscanf(args, "%d", &count); n != 1 || err != nil || count < 1 || count > 50 {
+			b.SendMessage(ctx, &bot.SendMessageParams{
+				ChatID: m.Message.Chat.ID,
+				Text:   "Usage: /last [N], where N is a number between 1 and 50",
+			})
+			return
+		}
+	}
+	accessToken, _ := s.store.GetUserAccessToken(userID)
+	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("Authorization", fmt.Sprintf("Bearer %s", accessToken)))
+	user, err := s.client.AuthService.GetAuthStatus(ctx, &v1pb.GetAuthStatusRequest{})
+	if err != nil {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: m.Message.Chat.ID,
+			Text:   "Invalid access token",
+		})
+		return
+	}
+	results, err := s.client.MemoService.ListMemos(ctx, &v1pb.ListMemosRequest{
+		PageSize: int32(count),
+		Parent:   user.Name,
+	})
+	if err != nil {
+		slog.Error("failed to fetch last memos", slog.Any("err", err))
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: m.Message.Chat.ID,
+			Text:   "Failed to fetch last memos.",
+		})
+		return
+	}
+	memos := results.GetMemos()
+	if len(memos) == 0 {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: m.Message.Chat.ID,
+			Text:   "No memos found.",
+		})
+		return
+	}
+	for _, memo := range memos {
+		msg := memo.Name + "\n" + memo.Content
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: m.Message.Chat.ID,
+			Text:   msg,
+		})
+	}
+}
+
+func (s *Service) helpHandler(ctx context.Context, b *bot.Bot, m *models.Update) {
+	helpText := "🤖 *Welcome to Memogram Bot!*\n\n" +
+		"Memogram helps you quickly save, search, and manage notes and files right from Telegram. Everything is synced with your Memos account.\n\n" +
+		"*How to save notes:*\n" +
+		"- Send any text message to save it as a note.\n" +
+		"- Send photos, documents, or voice messages — they will be attached to a new note.\n\n" +
+		"*Working with notes:*\n" +
+		"- Each note you create will have action buttons:\n" +
+		"  • *Public/Private*: Change who can see your note.\n" +
+		"  • *Pin*: Pin or unpin important notes.\n" +
+		"  • *Delete*: Remove a note you no longer need.\n\n" +
+		"*Available commands:*\n" +
+		"/start <access_token> — Link your Memos account (required on first use).\n" +
+		"/help — Show this help message.\n" +
+		"/search <query> — Find notes containing specific words.\n" +
+		"/last — Show your most recent note.\n" +
+		"/last N — Show your last N notes (replace N with a number, max 50).\n\n" +
+		"*Examples:*\n" +
+		"- /search project\n" +
+		"- /last 5\n\n" +
+		"*Tips:*\n" +
+		"- Use the buttons under each note to quickly change its status or delete it.\n" +
+		"- You can always re-link your account with /start <access_token> if you change your Memos password or token.\n" +
+		"- If you see 'Invalid access token', make sure your token is correct and up to date.\n\n" +
+		"Need more help? Just type /help anytime!";
+	b.SendMessage(ctx, &bot.SendMessageParams{
+		ChatID:    m.Message.Chat.ID,
+		Text:      helpText,
+		ParseMode: models.ParseModeMarkdown,
+	})
+}
+
 func (s *Service) searchHandler(ctx context.Context, b *bot.Bot, m *models.Update) {
 	userID := m.Message.From.ID
 	searchString := strings.TrimPrefix(m.Message.Text, "/search ")
+	if strings.TrimSpace(searchString) == "" {
+		b.SendMessage(ctx, &bot.SendMessageParams{
+			ChatID: m.Message.Chat.ID,
+			Text:   "Please provide a search query. Usage: /search <query>",
+		})
+		return
+	}
 	accessToken, _ := s.store.GetUserAccessToken(userID)
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("Authorization", fmt.Sprintf("Bearer %s", accessToken)))
 	user, err := s.client.AuthService.GetAuthStatus(ctx, &v1pb.GetAuthStatusRequest{})
